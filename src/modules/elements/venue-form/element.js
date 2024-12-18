@@ -3,6 +3,7 @@
  */
 import React from 'react';
 import { get, noop, pick } from 'lodash';
+import { PropTypes } from 'prop-types';
 
 /**
  * WordPress dependencies
@@ -62,12 +63,15 @@ export function toVenue( fields ) {
 		meta: {
 			_VenueAddress: address,
 			_VenueCity: city,
-			_VenueCountry: get( list.countries, country, '' ) || country,
-			_VenueProvince: get( list.us_states, stateProvince, '' ) || stateProvince,
+			_VenueCountry: country,
+			_VenueProvince: stateProvince,
 			_VenueZip: zip,
 			_VenuePhone: phone,
 			_VenueURL: url,
+			_VenueState: stateProvince,
 			_VenueStateProvince: stateProvince,
+			_VenueShowMap: true,
+			_VenueShowMapLink: true,
 		},
 	};
 }
@@ -77,6 +81,10 @@ export function toVenue( fields ) {
  */
 
 export default class VenueForm extends Component {
+	static propTypes = {
+		onSubmit: PropTypes.func,
+	};
+
 	static defaultProps = {
 		onSubmit: noop,
 	};

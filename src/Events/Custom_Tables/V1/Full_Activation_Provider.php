@@ -12,7 +12,8 @@
 
 namespace TEC\Events\Custom_Tables\V1;
 
-use tad_DI52_ServiceProvider as Service_Provider;
+use TEC\Common\Contracts\Service_Provider;
+
 use TEC\Events\Custom_Tables\V1\Events\Occurrences\Max_Recurrence_Provider;
 use TEC\Events\Custom_Tables\V1\Schema_Builder\Schema_Builder;
 use WP_CLI;
@@ -137,7 +138,7 @@ class Full_Activation_Provider extends Service_Provider {
 	 *
 	 * @since 6.0.2
 	 *
-	 * @param int $blog_id The blog ID to udpate the tables for.
+	 * @param int $blog_id The blog ID to update the tables for.
 	 *
 	 * @return void        Custom tables are updated, if required.
 	 */

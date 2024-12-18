@@ -2,7 +2,7 @@
 
 namespace TEC\Events\Custom_Tables\V1\Events\Event_Cleaner;
 
-use tad_DI52_ServiceProvider as Service_Provider;
+use TEC\Common\Contracts\Service_Provider;
 use Tribe__Events__Event_Cleaner_Scheduler;
 use Tribe__Events__Main;
 use Tribe__Main;
@@ -65,12 +65,17 @@ class Provider extends Service_Provider {
 		}, 99 );
 
 		// Hide from settings page.
-		add_filter( 'tribe_general_settings_tab_fields', function ( $args ) {
-			$event_cleaner = tribe( 'tec.event-cleaner' );
-			unset( $args[ $event_cleaner->key_delete_events ] );
+		add_filter(
+			'tribe_general_settings_maintenance_section',
+			function ( $args ) {
+				$event_cleaner = tribe( 'tec.event-cleaner' );
+				unset( $args[ $event_cleaner->key_delete_events ] );
 
-			return $args;
-		}, 99, 1 );
+				return $args;
+			},
+			99,
+			1
+		);
 
 		// Remove scheduled cleaner task.
 		add_action( 'init', function () {

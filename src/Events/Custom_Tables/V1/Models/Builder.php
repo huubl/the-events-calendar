@@ -9,6 +9,9 @@ namespace TEC\Events\Custom_Tables\V1\Models;
 
 use Generator;
 use InvalidArgumentException;
+use TEC\Common\Configuration\Configuration;
+use Tribe__Cache;
+use Tribe__Cache_Listener;
 
 /**
  * Class Builder
@@ -91,9 +94,18 @@ class Builder {
 	 *
 	 * @since 6.0.0
 	 *
-	 * @var string[] wheres
+	 * @var string[] The WHERE clauses.
 	 */
 	private $wheres = [];
+
+	/**
+	 * The list of args in an associative array of the query params for each where clause.
+	 *
+	 * @since 6.1.3
+	 *
+	 * @var array<<string,mixed>>
+	 */
+	private $where_args = [];
 
 	/**
 	 * Variable holding the value used to limit the results from the Query.
@@ -267,6 +279,7 @@ class Builder {
 	/**
 	 * Insert a new row or update one if already exists.
 	 *
+	 * @since 6.1.3 Integration with memoization.
 	 * @since 6.0.0
 	 *
 	 * @param array<string>            $unique_by A list of columns that are marked as UNIQUE on the database.
@@ -281,7 +294,7 @@ class Builder {
 
 		// If no input was provided use the model as input.
 		if ( $data === null ) {
-			$model = $this->set_data_to_model();
+			$model = $this->model;
 			$model->validate();
 		} else {
 			if ( empty( $data ) ) {
@@ -351,10 +364,29 @@ class Builder {
 			 */
 			$result = $wpdb->query( $SQL );
 			if ( $result === false ) {
-				do_action( 'tribe_log', 'debug', 'Builder: upsert query failure.', [
-					'source' => __CLASS__ . ' ' . __METHOD__ . ' ' . __LINE__,
-					'trace'  => debug_backtrace( 2, 5 )
-				] );
+				do_action(
+					'tribe_log',
+					'debug',
+					'Builder: query failure.',
+					[
+						'source' => __CLASS__ . ' ' . __METHOD__ . ' ' . __LINE__,
+						'trace'  => debug_backtrace( 2, 5 ), // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_debug_backtrace
+						'error'  => $wpdb->last_error,
+					]
+				);
+			}
+
+			// If we have a cache, let's clear it.
+			// It may be either a static call or on an instance, handle both.
+			if ( $data !== null ) {
+				// Attempt to generate a cache key by the upsert key.
+				foreach ( $unique_by as $field ) {
+					$value = $data[ $field ] ?? null;
+					$key   = self::generate_cache_key( $model, $field, $value );
+					tribe_cache()->delete( $key, Tribe__Cache_Listener::TRIGGER_SAVE_POST );
+				}
+			} else {
+				$model->flush_cache();
 			}
 
 			return $result;
@@ -407,21 +439,12 @@ class Builder {
 			$columns      = $validated['columns'];
 			$placeholders = $validated['placeholders'];
 
-			$SQL             = "INSERT INTO {$wpdb->prefix}{$this->model->table_name()} ($columns) VALUES $placeholders";
-			$SQL             = $wpdb->prepare( $SQL, ...$validated['values'] );
-			$this->queries[] = $SQL;
+			$sql             = "INSERT INTO {$wpdb->prefix}{$this->model->table_name()} ($columns) VALUES $placeholders";
+			$sql             = $wpdb->prepare( $sql, ...$validated['values'] );
+			$this->queries[] = $sql;
 			if ( $this->execute_queries ) {
-				$query_result = $wpdb->query( $SQL );
+				$query_result = $this->query( $sql );
 				$result       += (int) $query_result;
-			}
-			// Log our errors.
-			if ( $query_result === false && $wpdb->last_error ) {
-				do_action( 'tribe_log',
-					'error',
-					"ORM Builder mysql error while performing insert on {$this->model->table_name()}.", [
-						'source'      => __METHOD__ . ':' . __LINE__,
-						'mysql error' => $wpdb->last_error,
-					] );
 			}
 		} while ( count( $data ) );
 
@@ -433,7 +456,7 @@ class Builder {
 	/**
 	 * Perform updates against a model that already exists on the database.
 	 *
-	 *
+	 * @since 6.1.3 Integration with memoization.
 	 * @since 6.0.0
 	 *
 	 * @param array|null $data    If the data is null the data of the model would be used to set an update, otherwise
@@ -449,7 +472,7 @@ class Builder {
 		}
 
 		if ( $data === null ) {
-			$model = $this->set_data_to_model();
+			$model = $this->model;
 			$model->validate();
 		} else {
 			if ( empty( $data ) ) {
@@ -501,17 +524,21 @@ class Builder {
 			$pieces[] = $where;
 		}
 
-		$SQL = implode( "\n", $pieces );
+		$sql = implode( "\n", $pieces );
 
-		$this->queries[] = $SQL;
+		$this->queries[] = $sql;
 
-		return $this->execute_queries ? $wpdb->query( $SQL ) : false;
+		// If we have a cache, let's clear it.
+		$model->flush_cache();
+
+		return $this->execute_queries ? $this->query( $sql ) : false;
 	}
 
 	/**
 	 * Run a delete operation against an existing model if the model has not been persisted on the DB the operation
 	 * will fail.
 	 *
+	 * @since 6.1.3 Integration with memoization.
 	 * @since 6.0.0
 	 *
 	 * @return int The number of affected rows.
@@ -528,13 +555,23 @@ class Builder {
 		}
 
 		$this->queries[] = $SQL;
-		$result          = $this->execute_queries ? $wpdb->query( $SQL ) : false;
+		$result          = $this->execute_queries ? $this->query( $SQL ) : false;
 
 		// If an error happen or no row was updated by the query above.
 		if ( $result === false || (int) $result === 0 ) {
 			return 0;
 		}
 
+		foreach ( $this->where_args as $args ) {
+			$field = $args['field'] ?? null;
+			$value = $args['value'] ?? null;
+			// Not a valid item.
+			if ( ! $field || ! $value ) {
+				continue;
+			}
+			$key = self::generate_cache_key( $this->model, $field, $value );
+			tribe_cache()->delete( $key, Tribe__Cache_Listener::TRIGGER_SAVE_POST );
+		}
 		$this->model->reset();
 
 		return absint( $result );
@@ -544,6 +581,7 @@ class Builder {
 	 * Find an instance of the model in the database using a specific value and column if no column is specified
 	 * the primary key is used.
 	 *
+	 * @since 6.1.3 Added memoization behind a feature flag (default on).
 	 * @since 6.0.0
 	 *
 	 * @param mixed|array<mixed> $value  The value, or values, of the column we are looking for.
@@ -553,8 +591,52 @@ class Builder {
 	 */
 	public function find( $value, $column = null ) {
 		$column = null === $column ? $this->model->primary_key_name() : $column;
+		$conf   = tribe( Configuration::class );
 
-		return $this->where( $column, $value )->first();
+		// Memoize disabled?
+		if ( $conf->get( 'TEC_NO_MEMOIZE_CT1_MODELS' ) ) {
+			return $this->where( $column, $value )->first();
+		}
+
+		// Check if we memoized this instance.
+		$key    = self::generate_cache_key( $this->model, $column, $value );
+		$data = tribe_cache()->get( $key, Tribe__Cache_Listener::TRIGGER_SAVE_POST, null, Tribe__Cache::NON_PERSISTENT );
+
+		if ( $data ) {
+			$model_class = get_class( $this->model );
+			$result = new $model_class( $data );
+			$result->cache_key = $key;
+
+			return $result;
+		}
+
+		// Not memoized, fetch it.
+		$result = $this->where( $column, $value )->first();
+		if ( $result ) {
+			// Store on model so we can use it to cache bust later.
+			$result->cache_key = $key;
+
+			tribe_cache()->set( $key, $result->to_array(), Tribe__Cache::NON_PERSISTENT, Tribe__Cache_Listener::TRIGGER_SAVE_POST );
+		}
+
+		return $result;
+	}
+
+	/**
+	 * Generates a cache key for this particular model instance.
+	 *
+	 * @since 6.1.3
+	 *
+	 * @param Model  $model The instance we are generating a cache key for.
+	 * @param string $field The field we are searching / caching by.
+	 * @param mixed  $value The value we are searching / caching with.
+	 *
+	 * @return string
+	 */
+	public static function generate_cache_key( Model $model, $field, $value ): string {
+		$value = ! is_string( $value ) ? serialize( $value ) : $value;
+
+		return $field . $value . get_class( $model );
 	}
 
 	/**
@@ -581,6 +663,13 @@ class Builder {
 		global $wpdb;
 
 		$placeholders   = implode( ',', $result['placeholders'] );
+		$where_args = [
+			'field'          => $column,
+			'operator'       => 'IN',
+			'prepare_format' => $result['placeholders'],
+			'value'          => $result['values']
+		];
+		$this->where_args[] = $where_args;
 		$this->wheres[] = $wpdb->prepare( "(`{$column}` IN ({$placeholders}))", $result['values'] );
 
 		return $this;
@@ -610,6 +699,13 @@ class Builder {
 		global $wpdb;
 
 		$placeholders   = implode( ',', $result['placeholders'] );
+		$where_args = [
+			'field'          => $column,
+			'operator'       => 'NOT IN',
+			'prepare_format' => $result['placeholders'],
+			'value'          => $result['values']
+		];
+		$this->where_args[] = $where_args;
 		$this->wheres[] = $wpdb->prepare( "(`{$column}` NOT IN ({$placeholders}))", $result['values'] );
 
 		return $this;
@@ -718,8 +814,6 @@ class Builder {
 			return;
 		}
 
-		$this->query = '';
-
 		list( $column, $data, $format ) = $column_data_format;
 
 		$operator = is_array( $value ) ? 'IN' : '=';
@@ -743,6 +837,14 @@ class Builder {
 			if ( empty( $results ) ) {
 				// Run a fetch if we're out of results to return, maybe get some results.
 				$results = $wpdb->get_results( $semi_prepared . " OFFSET {$offset}", ARRAY_A );
+				if ( $results === false || $wpdb->last_error ) {
+					do_action( 'tribe_log', 'debug', 'Builder: query failure.', [
+						'source' => __METHOD__ . ':' . __LINE__,
+						'trace'  => debug_backtrace( 2, 5 ), // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_debug_backtrace
+						'error'  => $wpdb->last_error
+					] );
+				}
+
 				$offset  += $batch_size;
 				$found   = count( $results );
 				$results = array_reverse( $results );
@@ -818,14 +920,55 @@ class Builder {
 			return 0;
 		}
 
-		$SQL             = $this->get_sql();
-		$this->queries[] = $SQL;
+		$sql             = $this->get_sql();
+		$this->queries[] = $sql;
 
-		if ( $this->execute_queries ) {
-			return (int) $wpdb->get_var( $SQL );
+		$result = $wpdb->get_var( $sql );
+		if ( $result === false || $wpdb->last_error ) {
+			do_action(
+				'tribe_log',
+				'debug',
+				'Builder: query failure.',
+				[
+					'source' => __METHOD__ . ':' . __LINE__,
+					'trace'  => debug_backtrace( 2, 5 ), // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_debug_backtrace
+					'error'  => $wpdb->last_error,
+				]
+			);
 		}
 
-		return 0;
+		return (int) $result;
+	}
+
+	/**
+	 * Run a query and return the results directly from $wpdb->query().
+	 *
+	 * @since 6.3.1
+	 *
+	 * @param string $query The SQL query to run on the database.
+	 *
+	 * @return bool|int|mixed|\mysqli_result|resource|null The query result or null.
+	 */
+	protected function query( string $query ) {
+		global $wpdb;
+		$result = null;
+		if ( $this->execute_queries ) {
+			$result = $wpdb->query( $query );
+			if ( $result === false || $wpdb->last_error ) {
+				do_action(
+					'tribe_log',
+					'debug',
+					'Builder: query failure.',
+					[
+						'source' => __METHOD__ . ':' . __LINE__,
+						'trace'  => debug_backtrace( 2, 5 ), // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_debug_backtrace
+						'error'  => $wpdb->last_error,
+					]
+				);
+			}
+		}
+
+		return $result;
 	}
 
 	/**
@@ -913,6 +1056,14 @@ class Builder {
 				$SQL,
 				ARRAY_A
 			);
+
+			if ( $results === false || $wpdb->last_error ) {
+				do_action( 'tribe_log', 'debug', 'Builder: query failure.', [
+					'source' => __CLASS__ . ' ' . __METHOD__ . ' ' . __LINE__,
+					'trace'  => debug_backtrace( 2, 5 ), // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_debug_backtrace
+					'error'  => $wpdb->last_error
+				] );
+			}
 		}
 
 		if ( ARRAY_A === $this->output_format ) {
@@ -1004,8 +1155,8 @@ class Builder {
 		// Add a where clause with the primary key of the model if no where was specified.
 		$pk = $this->model->primary_key_name();
 		if ( isset( $this->model->{$pk} ) ) {
-			$this->wheres = [];
-
+			$this->wheres     = [];
+			$this->where_args = [];
 			$this->where( $pk, $this->model->{$pk} );
 
 			if ( empty( $this->wheres ) ) {
@@ -1033,6 +1184,7 @@ class Builder {
 	 */
 	public function where( $column, $operator = null, $value = null ) {
 		$this->invalid = false;
+		$where_args = null;
 
 		// If only 2 arguments are provided use the second argument as the value and assume the operator is "="
 		if ( func_num_args() === 2 ) {
@@ -1066,13 +1218,27 @@ class Builder {
 			global $wpdb;
 			$format = $format[ $column ];
 
-			$this->wheres[] = $wpdb->prepare( "(`{$column}` {$operator} {$format})", $data[ $column ] );
+			$where_args = [
+				'field'          => $column,
+				'operator'       => $operator,
+				'prepare_format' => $format,
+				'value'          => $data[ $column ]
+			];
+
+			$this->where_args[] = $where_args;
+			$this->wheres[]     = $wpdb->prepare( "(`{$column}` {$operator} {$format})", $data[ $column ] );
 
 			return $this;
 		}
 
 		if ( $value === null ) {
-			$this->wheres[] = "(`{$column}` {$operator} NULL)";
+			$where_args         = [
+				'field'    => $column,
+				'operator' => $operator,
+				'value'    => null
+			];
+			$this->where_args[] = $where_args;
+			$this->wheres[]     = "(`{$column}` {$operator} NULL)";
 		}
 
 		return $this;
@@ -1280,7 +1446,9 @@ class Builder {
 	/**
 	 * If an instance already exists refresh the values by querying the same value against the DB.
 	 *
+	 * @since 6.1.3 Integration with memoization.
 	 * @since 6.0.0
+	 *
 	 * @return Model
 	 */
 	public function refresh() {
@@ -1289,6 +1457,8 @@ class Builder {
 			return $this->model;
 		}
 
+		// If we have a cache, let's clear it.
+		$this->model->flush_cache();
 		$model = $this->find( $this->model->{$pk}, $pk );
 
 		if ( $model === null ) {
@@ -1354,7 +1524,12 @@ class Builder {
 	 */
 	public function where_raw( $query, ...$args ) {
 		global $wpdb;
-		$this->wheres[] = '(' . $wpdb->prepare( $query, ...$args ) . ')';
+		$where_args         = [
+			'operator' => 'raw',
+			'value'    => $query
+		];
+		$this->where_args[] = $where_args;
+		$this->wheres[]     = '(' . $wpdb->prepare( $query, ...$args ) . ')';
 
 		return $this;
 	}
@@ -1416,10 +1591,12 @@ class Builder {
 	 * Bulk updates instances of the Model.
 	 *
 	 * Since MySQL does not come with a bulk update feature, this code will actually
-	 * delete the exising model entries and re-insert them, by primary key, using the
+	 * delete the existing model entries and re-insert them, by primary key, using the
 	 * updated data.
 	 *
+	 * @since 6.1.3 Integration with memoization.
 	 * @since 6.0.0
+	 *
 	 * @param array<Model>|array<array<string,mixed>> $models Either a list of Model
 	 *                                                        instances to update, or a
 	 *                                                        set of models in array format.
@@ -1441,7 +1618,14 @@ class Builder {
 		do {
 			$batch         = array_splice( $keys, 0, $this->batch_size );
 			$keys_interval = implode( ',', array_map( 'absint', $batch ) );
-			$deleted       += $wpdb->query( "DELETE FROM {$table} WHERE {$primary_key} IN ({$keys_interval})" );
+			$deleted       += $this->query( "DELETE FROM {$table} WHERE {$primary_key} IN ({$keys_interval})" );
+
+			// If we have a cache, let's clear it.
+			foreach ( $models as $model ) {
+				if ( $model instanceof Model ) {
+					$model->flush_cache();
+				}
+			}
 		} while ( count( $keys ) );
 
 		if ( $deleted !== $expected_count ) {
@@ -1452,7 +1636,7 @@ class Builder {
 				'table'       => $table,
 				'primary_key' => $primary_key,
 				'expected'    => $expected_count,
-				'deleted'     => $inserted,
+				'deleted'     => $deleted,
 			] );
 		}
 
